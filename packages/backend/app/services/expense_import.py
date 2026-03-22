@@ -53,17 +53,37 @@ def normalize_import_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         expense_type = _infer_expense_type(row.get("expense_type"), desc, amt)
         cid = row.get("category_id")
         category_id = int(cid) if cid not in (None, "", "null") else None
+        
+        amt_float = float(abs(amt))
+        # Nâng cấp: Tự động nhận diện tiền tệ nếu thiếu
+        currency = row.get("currency")
+        if not currency or currency == "USD":
+            currency = _infer_currency(desc, amt_float)
+
         normalized.append(
             {
                 "date": dt,
-                "amount": float(abs(amt)),
+                "amount": amt_float,
                 "description": desc[:500],
                 "category_id": category_id,
                 "expense_type": expense_type,
-                "currency": str(row.get("currency") or "USD")[:10],
+                "currency": str(currency)[:10],
             }
         )
     return normalized
+
+
+def _infer_currency(description: str, amount: float) -> str:
+    """Tự động nhận diện tiền tệ dựa trên mô tả và con số."""
+    desc = (description or "").upper()
+    if any(k in desc for k in ["VND", "VNĐ", " Đ ", "ĐỒNG", "DONG"]):
+        return "VND"
+    if "$" in desc or "USD" in desc:
+        return "USD"
+    # Logic: Nếu số tiền là số nguyên lớn (VND thường không có xu)
+    if amount >= 1000 and int(amount) == amount:
+        return "VND"
+    return "USD"
 
 
 def _parse_csv_rows(data: bytes) -> list[dict[str, Any]]:
@@ -71,13 +91,22 @@ def _parse_csv_rows(data: bytes) -> list[dict[str, Any]]:
     reader = csv.DictReader(io.StringIO(text))
     out: list[dict[str, Any]] = []
     for row in reader:
+        desc = row.get("description") or row.get("notes") or ""
+        amt_raw = row.get("amount")
+        amt_norm = _normalize_amount(amt_raw)
+        amt_float = float(abs(amt_norm)) if amt_norm is not None else 0.0
+        
+        currency = row.get("currency")
+        if not currency or currency == "USD":
+            currency = _infer_currency(desc, amt_float)
+
         out.append(
             {
                 "date": row.get("date") or row.get("spent_at"),
-                "amount": row.get("amount"),
-                "description": row.get("description") or row.get("notes"),
+                "amount": amt_raw,
+                "description": desc,
                 "category_id": row.get("category_id"),
-                "currency": row.get("currency") or "USD",
+                "currency": currency,
             }
         )
     return out
@@ -260,11 +289,12 @@ def _parse_pdf_line(line: str) -> dict[str, Any] | None:
     if len(description) < 2:
         return None
 
+    amt_float = float(abs(amount))
     return {
         "date": tx_date,
-        "amount": float(abs(amount)),
+        "amount": amt_float,
         "description": description,
         "category_id": None,
         "expense_type": _infer_expense_type(None, description, amount),
-        "currency": "USD",
+        "currency": _infer_currency(description, amt_float),
     }
