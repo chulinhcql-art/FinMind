@@ -8,6 +8,8 @@ from typing import Any
 
 import requests
 
+from .currency import get_exchange_rate
+
 try:
     from pypdf import PdfReader
 except Exception:  # pragma: no cover
@@ -28,21 +30,21 @@ def extract_transactions_from_statement(
     name = (filename or "").lower()
     ctype = (content_type or "").lower()
     if name.endswith(".csv") or "csv" in ctype:
-        return _parse_csv_rows(data)
+        return _parse_csv_rows(data, filename=name)
     if name.endswith(".pdf") or "pdf" in ctype:
         text = _extract_pdf_text(data)
         if gemini_api_key:
             try:
                 ai_rows = _extract_with_gemini(text, gemini_api_key, gemini_model)
-                if normalize_import_rows(ai_rows):
+                if normalize_import_rows(ai_rows, source=name):
                     return ai_rows
             except Exception:
                 pass
-        return _extract_pdf_rows_fallback(text)
+        return _extract_pdf_rows_fallback(text, source=name)
     raise ValueError("Only PDF and CSV files are supported")
 
 
-def normalize_import_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def normalize_import_rows(rows: list[dict[str, Any]], source: str = "local") -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for row in rows:
         dt = _normalize_date(row.get("date"))
@@ -55,15 +57,21 @@ def normalize_import_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         category_id = int(cid) if cid not in (None, "", "null") else None
         
         amt_float = float(abs(amt))
-        # Nâng cấp: Tự động nhận diện tiền tệ nếu thiếu
         currency = row.get("currency")
         if not currency or currency == "USD":
             currency = _infer_currency(desc, amt_float)
+
+        # [NÂNG CẤP V101.5] Tự động quy đổi sang VND dựa trên tỷ giá sống
+        amount_vnc = amt_float
+        if currency == "USD":
+            rate = get_exchange_rate(source=source, from_ccy="USD", to_ccy="VND")
+            amount_vnc = round(amt_float * rate, 2)
 
         normalized.append(
             {
                 "date": dt,
                 "amount": amt_float,
+                "amount_vnd": amount_vnc,
                 "description": desc[:500],
                 "category_id": category_id,
                 "expense_type": expense_type,
@@ -80,13 +88,12 @@ def _infer_currency(description: str, amount: float) -> str:
         return "VND"
     if "$" in desc or "USD" in desc:
         return "USD"
-    # Logic: Nếu số tiền là số nguyên lớn (VND thường không có xu)
     if amount >= 1000 and int(amount) == amount:
         return "VND"
     return "USD"
 
 
-def _parse_csv_rows(data: bytes) -> list[dict[str, Any]]:
+def _parse_csv_rows(data: bytes, filename: str = "csv") -> list[dict[str, Any]]:
     text = data.decode("utf-8-sig", errors="ignore")
     reader = csv.DictReader(io.StringIO(text))
     out: list[dict[str, Any]] = []
@@ -235,14 +242,14 @@ def _infer_expense_type(raw_type: Any, description: str, amount: Decimal) -> str
     return "EXPENSE"
 
 
-def _extract_pdf_rows_fallback(text: str) -> list[dict[str, Any]]:
+def _extract_pdf_rows_fallback(text: str, source: str = "pdf") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for raw_line in text.splitlines():
         line = re.sub(r"\s+", " ", raw_line).strip()
         if not line:
             continue
-        parsed = _parse_pdf_line(line)
+        parsed = _parse_pdf_line(line, source=source)
         if not parsed:
             continue
         key = (
@@ -257,7 +264,7 @@ def _extract_pdf_rows_fallback(text: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _parse_pdf_line(line: str) -> dict[str, Any] | None:
+def _parse_pdf_line(line: str, source: str = "pdf") -> dict[str, Any] | None:
     date_patterns = (
         r"^(\d{4}-\d{2}-\d{2})\s+(.+)$",
         r"^(\d{2}/\d{2}/\d{4})\s+(.+)$",
@@ -290,11 +297,20 @@ def _parse_pdf_line(line: str) -> dict[str, Any] | None:
         return None
 
     amt_float = float(abs(amount))
+    currency = _infer_currency(description, amt_float)
+    
+    # Quy đổi tỷ giá nếu là USD
+    amt_vnd = amt_float
+    if currency == "USD":
+        rate = get_exchange_rate(source=source, from_ccy="USD", to_ccy="VND")
+        amt_vnd = round(amt_float * rate, 2)
+
     return {
         "date": tx_date,
         "amount": amt_float,
+        "amount_vnd": amt_vnd,
         "description": description,
         "category_id": None,
         "expense_type": _infer_expense_type(None, description, amount),
-        "currency": _infer_currency(description, amt_float),
+        "currency": currency,
     }
